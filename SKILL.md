@@ -2,11 +2,11 @@
 
 ## Metadata
 - **name:** audio-transcriber
-- **description:** Транскрибация аудиофайлов любой длины (локальные файлы + YouTube) с обходом лимитов ASR API (30 секунд). Для YouTube использует Supadata API для мгновенного получения субтитров, с fallback на yt-dlp + ASR. Автоматически скачивает, конвертирует, режет на чанки, транскрибирует и склеивает результат. Опционально переводит на любой язык.
-- **version:** 3.0.0
+- **description:** Транскрибация аудиофайлов любой длины (локальные файлы + YouTube) с обходом лимитов ASR API (30 секунд). Для YouTube использует цепочку: user_proxy (безлимит, через IP пользователя) → Supadata API (100/мес) → Scrapingdog API → yt-dlp + ASR (fallback). Автоматически скачивает, конвертирует, режет на чанки, транскрибирует и склеивает результат. Опционально переводит на любой язык. Ротация API-ключей с трекингом использования.
+- **version:** 4.0.0
 - **author:** KindFarmAI
-- **tags:** audio, transcription, asr, translation, speech-to-text, youtube, supadata, yt-dlp
-- **tools:** ffmpeg, asr-cli, supadata-api, yt-dlp, llm
+- **tags:** audio, transcription, asr, translation, speech-to-text, youtube, supadata, scrapingdog, proxy, yt-dlp, key-rotation
+- **tools:** ffmpeg, asr-cli, supadata-api, scrapingdog-api, yt-dlp, llm
 
 ## Triggers
 Используй этот скилл когда пользователь:
@@ -18,21 +18,45 @@
 
 ## Instructions
 
-### YouTube-видео (приоритетный метод)
+### YouTube-видео (цепочка источников)
 
-Для YouTube-видео сначала используй **Supadata API** — он получает субтитры мгновенно через прокси-серверы, не нужно скачивать видео.
+Для YouTube-видео скилл пробует источники по порядку:
 
-**Требуется:** переменная окружения `SUPADATA_API_KEY`
-
-```bash
-SUPADATA_API_KEY=sd_xxx python3 audio_transcriber.py \
-  --input "https://youtube.com/watch?v=XXXXX" \
-  --lang ru
+```
+1. User Proxy (безлимит, через cloudflare tunnel на ПК пользователя)
+   ↓ если недоступен
+2. Supadata API (100 бесплатных запросов/мес, авторотация ключей)
+   ↓ если нет субтитров/ключа/лимит
+3. Scrapingdog API (альтернативный источник субтитров)
+   ↓ если не сработало
+4. yt-dlp + ASR (скачивание + локальная транскрипция)
 ```
 
-API возвращает JSON с сегментами: текст + offset + duration.
+**Переменные окружения:**
 
-Если Supadata не дал результат (нет субтитров) — fallback на yt-dlp + ASR.
+| Переменная | Описание | Обязательна |
+|-----------|----------|-------------|
+| `SUPADATA_API_KEYS` | API ключи supadata.ai (через запятую, для ротации) | Нет |
+| `SCRAPINGDOG_API_KEY` | API ключ scrapingdog.com | Нет |
+| `USER_PROXY_URL` | URL cloudflare tunnel прокси пользователя | Нет |
+
+**Примеры запуска:**
+
+```bash
+# Авто (пробует все источники по цепочке)
+python3 audio_transcriber.py --input "https://youtube.com/watch?v=XXXXX"
+
+# С указанием ключей
+SUPADATA_API_KEYS="sd_key1,sd_key2" \
+SCRAPINGDOG_API_KEY="69fbba..." \
+python3 audio_transcriber.py --input "https://youtube.com/watch?v=XXXXX"
+
+# С переводом
+python3 audio_transcriber.py --input "https://youtube.com/watch?v=XXXXX" --translate "ru"
+
+# Без таймстемпов
+python3 audio_transcriber.py --input "URL" --no-timestamps
+```
 
 ### Локальные аудиофайлы
 
@@ -82,15 +106,20 @@ done
 Пользователь даёт аудиофайл или YouTube-ссылку
         |
         v
-Это YouTube? --да--> Supadata API (субтитры через прокси)
-        |                   |
-        |            Есть субтитры?
-        |              да/     \нет
-        |              /         \
-        |         Форматировать  yt-dlp скачать + ASR
-        |             текст         транскрипция
-        |              \         /
-        +------<-------+---------+
+Это YouTube? --да--> Цепочка источников:
+        |              |
+        |              1. User Proxy (безлимит)
+        |              |    OK → транскрипт через youtube-transcript-api
+        |              |    FAIL ↓
+        |              2. Supadata API (100/мес, авторотация)
+        |              |    OK → форматировать текст
+        |              |    FAIL ↓
+        |              3. Scrapingdog API
+        |              |    OK → форматировать текст
+        |              |    FAIL ↓
+        |              4. yt-dlp скачать + ASR транскрипция
+        |              |
+        +------<-------+
         |
        нет
         v
@@ -123,8 +152,11 @@ done
 ## Транскрипция: [имя файла / название видео]
 
 **Источник:** YouTube / Локальный файл
+**Video ID:** XXXXX (для YouTube)
 **Длительность:** X:XX
-**Метод:** Supadata API / ASR (z-ai)
+**Язык:** ru/en/...
+**Сегментов:** N
+**Метод:** User Proxy / Supadata / Scrapingdog / yt-dlp + ASR
 
 ### Текст:
 
@@ -138,7 +170,7 @@ done
 
 ## Важные правила
 
-1. Для YouTube — ВСЕГДА сначала пробуй Supadata API (если есть ключ)
+1. Для YouTube — пробуй источники строго по цепочке: user_proxy → supadata → scrapingdog → yt-dlp
 2. ВСЕГДА проверяй реальную длину аудио через декодирование, а не через метаданные
 3. Максимальный размер чанка — 29 секунд (не 30, с запасом)
 4. Если текст песни — проверь наличие встроенных lyrics (metadata) в файле
@@ -146,11 +178,21 @@ done
 6. После транскрипции — удаляй временные файлы
 7. Если чанк пустой/инструментальный — пропусти его
 8. Для качественной транскрипции используй 16kHz sample rate
-9. Для YouTube нужен yt-dlp только как fallback: pip install yt-dlp
-10. Supadata API даёт 100 бесплатных запросов в месяц
+9. Supadata ключи ротируются автоматически при достижении лимита (100/30 дней)
+10. User Proxy — временный URL, нужен каждый раз при перезапуске
+11. Скрипт показывает какой источник использовался и сколько кредитов осталось
 
 ## Переменные окружения
 
 | Переменная | Описание | Обязательна |
 |-----------|----------|-------------|
-| `SUPADATA_API_KEY` | API ключ для supadata.ai | Нет (только для YouTube) |
+| `SUPADATA_API_KEYS` | API ключи supadata.ai через запятую (для ротации) | Нет |
+| `SCRAPINGDOG_API_KEY` | API ключ scrapingdog.com | Нет |
+| `USER_PROXY_URL` | URL cloudflare tunnel (user proxy) | Нет |
+
+## Ротация ключей
+
+- Несколько Supadata ключей можно указать через запятую
+- Автоматическая ротация при достижении 100 запросов
+- Автоматический сброс каждые 30 дней
+- Статистика использования отслеживается

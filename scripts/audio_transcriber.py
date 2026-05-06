@@ -2,10 +2,14 @@
 """
 audio_transcriber.py — Транскрибация аудиофайлов и YouTube-видео.
 
-Поддерживает три режима работы:
-  1. Локальные аудиофайлы — через ASR (нарезка на чанки по 29 сек)
-  2. YouTube-видео с субтитрами — через Supadata API (быстро, бесплатно)
-  3. YouTube-видео без субтитров — через yt-dlp + ASR (если API не даёт результат)
+Поддерживает четыре режима работы для YouTube (по цепочке):
+  1. User Proxy (cloudflare tunnel на ПК пользователя) — безлимит
+  2. Supadata API — 100 бесплатных запросов/мес, авторотация ключей
+  3. Scrapingdog API — альтернативный источник субтитров
+  4. yt-dlp + ASR — fallback (скачивание + локальная транскрипция)
+
+Для локальных файлов:
+  - ASR через z-ai CLI (нарезка на чанки по 29 сек)
 
 Использование:
     python3 audio_transcriber.py --input "file.mp3"
@@ -16,13 +20,15 @@ audio_transcriber.py — Транскрибация аудиофайлов и Yo
     - ffmpeg (установлен в системе)
     - z-ai CLI (z-ai-web-dev-sdk) — для локальных файлов
     - yt-dlp (для YouTube без субтитров, опционально)
-    - Supadata API ключ (для YouTube субтитров, опционально)
 
 Переменные окружения:
-    SUPADATA_API_KEY — API ключ для supadata.ai
+    SUPADATA_API_KEYS    — API ключи supadata.ai через запятую
+    SCRAPINGDOG_API_KEY  — API ключ scrapingdog.com
+    USER_PROXY_URL       — URL cloudflare tunnel прокси
 
 Автор: KindFarmAI / Zai Chat
 Лицензия: MIT
+Версия: 4.0.0
 """
 
 import argparse
@@ -35,15 +41,102 @@ import sys
 import tempfile
 import urllib.request
 import urllib.parse
+import urllib.error
 from pathlib import Path
+from datetime import datetime
 
 
 # ============================================================
-# Supadata API — YouTube транскрипты через прокси
+# Конфигурация из переменных окружения
 # ============================================================
 
-SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "")
+def get_supadata_keys():
+    """Получить список Supadata ключей из переменных окружения."""
+    raw = os.environ.get("SUPADATA_API_KEYS", os.environ.get("SUPADATA_API_KEY", ""))
+    if not raw:
+        return []
+    return [k.strip() for k in raw.split(",") if k.strip()]
 
+
+def get_supadata_usage_file():
+    """Путь к файлу с трекингом использования."""
+    config_dir = os.path.join(os.path.expanduser("~"), ".audio-transcriber")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, "supadata_usage.json")
+
+
+def load_usage():
+    """Загрузить статистику использования."""
+    usage_file = get_supadata_usage_file()
+    if os.path.exists(usage_file):
+        try:
+            with open(usage_file) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"cycle_start": None, "active_index": 0, "usage": 0}
+
+
+def save_usage(data):
+    """Сохранить статистику использования."""
+    usage_file = get_supadata_usage_file()
+    with open(usage_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_active_supadata_key():
+    """Получить активный Supadata ключ с авторотацией."""
+    keys = get_supadata_keys()
+    if not keys:
+        return None, "no_keys"
+
+    data = load_usage()
+    idx = data.get("active_index", 0)
+
+    # Автосброс каждые 30 дней
+    cycle_start = data.get("cycle_start")
+    if cycle_start:
+        start = datetime.fromisoformat(cycle_start)
+        if (datetime.now() - start).days >= 30:
+            data["cycle_start"] = datetime.now().isoformat()
+            data["usage"] = 0
+            data["active_index"] = 0
+            idx = 0
+            save_usage(data)
+            print("  [Supadata] Новый 30-дневный цикл", file=sys.stderr)
+
+    if not cycle_start:
+        data["cycle_start"] = datetime.now().isoformat()
+        save_usage(data)
+
+    # Авторотация при достижении лимита
+    if data["usage"] >= 100 and len(keys) > 1:
+        idx = (idx + 1) % len(keys)
+        data["active_index"] = idx
+        data["usage"] = 0
+        save_usage(data)
+        print(f"  [Supadata] Ротация на ключ #{idx+1}/{len(keys)}", file=sys.stderr)
+
+    key = keys[idx] if idx < len(keys) else keys[0]
+    remaining = 100 - data["usage"]
+    print(f"  [Supadata] Ключ #{idx+1}, использовано {data['usage']}/100", file=sys.stderr)
+    return key, "ok"
+
+
+def increment_supadata_usage():
+    """Увеличить счётчик использования."""
+    data = load_usage()
+    data["usage"] = data.get("usage", 0) + 1
+    save_usage(data)
+
+
+SCRAPINGDOG_API_KEY = os.environ.get("SCRAPINGDOG_API_KEY", "69fbba589bf608055686bd75")
+USER_PROXY_URL = os.environ.get("USER_PROXY_URL", "")
+
+
+# ============================================================
+# Утилиты для YouTube
+# ============================================================
 
 def extract_youtube_id(url: str) -> str:
     """Извлечь video ID из любой формы YouTube-ссылки."""
@@ -56,59 +149,6 @@ def extract_youtube_id(url: str) -> str:
             return match.group(1)
     return ""
 
-
-def get_supadata_transcript(video_id: str, lang: str = None) -> dict:
-    """Получить транскрипт YouTube-видео через Supadata API.
-
-    Returns:
-        dict с ключами: lang, available_langs, content (list of {text, offset, duration})
-        или None если не удалось
-    """
-    if not SUPADATA_API_KEY:
-        return None
-
-    url = f"https://api.supadata.ai/v1/youtube/transcript?id={video_id}"
-    if lang:
-        url += f"&lang={lang}"
-
-    headers = {
-        'x-api-key': SUPADATA_API_KEY,
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Origin': 'https://supadata.ai',
-        'Referer': 'https://supadata.ai/',
-    }
-
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=30)
-        result = json.loads(resp.read().decode('utf-8'))
-
-        if result.get('content') and len(result['content']) > 0:
-            return result
-        return None
-    except Exception as e:
-        print(f"  [Supadata] Не удалось получить транскрипт: {e}", file=sys.stderr)
-        return None
-
-
-def format_supadata_transcript(data: dict) -> str:
-    """Преобразовать результат Supadata в текст с таймстемпами."""
-    lines = []
-    for seg in data.get('content', []):
-        offset_ms = seg.get('offset', 0)
-        offset_s = offset_ms / 1000
-        minutes = int(offset_s // 60)
-        seconds = int(offset_s % 60)
-        timestamp = f"[{minutes:02d}:{seconds:02d}]"
-        text = seg.get('text', '').strip()
-        lines.append(f"{timestamp} {text}")
-    return "\n".join(lines)
-
-
-# ============================================================
-# YouTube detection
-# ============================================================
 
 def is_youtube_url(url: str) -> bool:
     """Проверить, является ли строка YouTube-ссылкой."""
@@ -127,15 +167,169 @@ def is_youtube_url(url: str) -> bool:
 
 
 # ============================================================
-# YouTube download (yt-dlp) — fallback если Supadata не сработал
+# Источник 1: User Proxy (youtube-transcript-api через tunnel)
+# ============================================================
+
+def get_via_user_proxy(video_id: str) -> dict:
+    """Получить транскрипт через user proxy (cloudflare tunnel).
+
+    Прокси запускается на ПК пользователя: yt_proxy.py (порт 9090) + cloudflared.
+    Запрос идёт на /transcript?v=VIDEO_ID.
+    """
+    if not USER_PROXY_URL:
+        return None
+
+    url = f"{USER_PROXY_URL.rstrip('/')}/transcript?v={video_id}"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+        })
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read().decode('utf-8'))
+
+        if data.get("error"):
+            print(f"  [User Proxy] Ошибка: {data['error']}", file=sys.stderr)
+            return None
+
+        content = data.get("content", [])
+        if not content:
+            return None
+
+        # Нормализуем формат
+        segments = []
+        for seg in content:
+            segments.append({
+                "text": seg.get("text", "").strip(),
+                "offset": int(seg.get("start", 0) * 1000),  # сек → мс
+                "duration": int(seg.get("duration", 0) * 1000),
+            })
+
+        return {
+            "source": "user_proxy",
+            "lang": ", ".join(data.get("languages", [])),
+            "content": segments,
+        }
+    except Exception as e:
+        print(f"  [User Proxy] Недоступен: {e}", file=sys.stderr)
+        return None
+
+
+# ============================================================
+# Источник 2: Supadata API
+# ============================================================
+
+def get_via_supadata(video_id: str, lang: str = None) -> dict:
+    """Получить транскрипт через Supadata API."""
+    key, status = get_active_supadata_key()
+    if status != "ok":
+        return None
+
+    url = f"https://api.supadata.ai/v1/youtube/transcript?id={video_id}"
+    if lang:
+        url += f"&lang={lang}"
+
+    headers = {
+        'x-api-key': key,
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': 'https://supadata.ai',
+        'Referer': 'https://supadata.ai/',
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30)
+        result = json.loads(resp.read().decode('utf-8'))
+
+        increment_supadata_usage()
+
+        if result.get('content') and len(result['content']) > 0:
+            result['source'] = 'supadata'
+            return result
+        return None
+    except Exception as e:
+        print(f"  [Supadata] Ошибка: {e}", file=sys.stderr)
+        return None
+
+
+# ============================================================
+# Источник 3: Scrapingdog API
+# ============================================================
+
+def get_via_scrapingdog(video_id: str) -> dict:
+    """Получить транскрипт через Scrapingdog YouTube Transcript API."""
+    if not SCRAPINGDOG_API_KEY:
+        return None
+
+    url = f"https://api.scrapingdog.com/youtube/transcripts/?api_key={SCRAPINGDOG_API_KEY}&v={video_id}"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+        })
+        resp = urllib.request.urlopen(req, timeout=30)
+        data = json.loads(resp.read().decode('utf-8'))
+
+        content = data.get("content") or data.get("transcripts")
+        if not content or (isinstance(content, str) and not content.strip()):
+            return None
+
+        # Нормализуем формат
+        segments = []
+        if isinstance(content, list):
+            for seg in content:
+                if isinstance(seg, dict):
+                    segments.append({
+                        "text": seg.get("text", "").strip(),
+                        "offset": seg.get("offset", seg.get("start", 0)),
+                        "duration": seg.get("duration", 0),
+                    })
+                elif isinstance(seg, str):
+                    segments.append({"text": seg.strip(), "offset": 0, "duration": 0})
+
+        if not segments:
+            return None
+
+        return {
+            "source": "scrapingdog",
+            "lang": data.get("language", data.get("lang", "?")),
+            "content": segments,
+        }
+    except Exception as e:
+        print(f"  [Scrapingdog] Ошибка: {e}", file=sys.stderr)
+        return None
+
+
+# ============================================================
+# Форматирование транскрипта
+# ============================================================
+
+def format_transcript(data: dict, no_timestamps: bool = False) -> str:
+    """Преобразовать результат в текст."""
+    segments = data.get("content", [])
+    if no_timestamps:
+        return " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip())
+
+    lines = []
+    for seg in segments:
+        offset_ms = seg.get("offset", 0)
+        offset_s = offset_ms / 1000 if offset_ms > 1000 else offset_ms
+        minutes = int(offset_s // 60)
+        seconds = int(offset_s % 60)
+        timestamp = f"[{minutes:02d}:{seconds:02d}]"
+        text = seg.get("text", "").strip()
+        if text:
+            lines.append(f"{timestamp} {text}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# YouTube download (yt-dlp) — fallback
 # ============================================================
 
 def download_youtube_audio(url: str, output_path: str) -> dict:
-    """Скачать аудио с YouTube через yt-dlp.
-
-    Returns:
-        dict с ключами: title, duration_str, filepath
-    """
+    """Скачать аудио с YouTube через yt-dlp."""
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp:
         local_ytdlp = os.path.expanduser("~/.local/bin/yt-dlp")
@@ -145,7 +339,7 @@ def download_youtube_audio(url: str, output_path: str) -> dict:
             print("[ОШИБКА] yt-dlp не найден. Установите: pip install yt-dlp", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Скачиваю аудио с YouTube...", end=" ", flush=True)
+    print(f"  Скачиваю аудио с YouTube...", end=" ", flush=True)
 
     tmp_download = os.path.join(os.path.dirname(output_path), "yt_download.%(ext)s")
 
@@ -305,22 +499,42 @@ def transcribe_chunks(chunks: list, chunk_dir: str) -> str:
 
 
 # ============================================================
+# Получить название видео
+# ============================================================
+
+def get_video_title(url: str) -> str:
+    """Получить название видео через noembed."""
+    try:
+        noembed_url = f"https://noembed.com/embed?url={urllib.parse.quote(url)}"
+        req = urllib.request.Request(noembed_url, headers={'User-Agent': 'Mozilla/5.0'})
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode('utf-8'))
+        return data.get('title', 'YouTube Video')
+    except Exception:
+        return 'YouTube Video'
+
+
+# ============================================================
 # Main
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Транскрибация аудиофайлов и YouTube-видео",
+        description="Транскрибация аудиофайлов и YouTube-видео (v4.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Цепочка источников для YouTube:
+  1. User Proxy (безлимит) → 2. Supadata API (100/мес) → 3. Scrapingdog → 4. yt-dlp+ASR
+
 Примеры:
   python3 audio_transcriber.py --input "song.mp3"
   python3 audio_transcriber.py --input "https://youtube.com/watch?v=XXXXX"
   python3 audio_transcriber.py --input "podcast.mp3" --translate "ru"
-  python3 audio_transcriber.py --input "interview.wav" --output "transcript.txt"
 
 Переменные окружения:
-  SUPADATA_API_KEY    API ключ для supadata.ai (YouTube субтитры через прокси)
+  SUPADATA_API_KEYS    Ключи supadata.ai через запятую (для ротации)
+  SCRAPINGDOG_API_KEY  Ключ scrapingdog.com
+  USER_PROXY_URL       URL cloudflare tunnel прокси
         """
     )
 
@@ -330,103 +544,119 @@ def main():
     parser.add_argument("--lang", "-l", default=None, help="Язык YouTube-субтитров (например: ru, en)")
     parser.add_argument("--chunk-size", "-c", type=int, default=29, help="Размер чанка в секундах (по умолчанию: 29)")
     parser.add_argument("--no-timestamps", action="store_true", help="Убрать таймстемпы из результата")
+    parser.add_argument("--source-only", action="store_true", help="Использовать только указанный источник (пропустить цепочку)")
 
     args = parser.parse_args()
     input_path = args.input
 
     is_yt = is_youtube_url(input_path)
+    yt_info = {"title": "", "duration_str": "0:00"}
 
     # =============================================
-    # YouTube путь — сначала пробуем Supadata API
+    # YouTube путь — цепочка источников
     # =============================================
     if is_yt:
         video_id = extract_youtube_id(input_path)
         print(f"Источник: YouTube (ID: {video_id})")
 
-        if SUPADATA_API_KEY:
-            print("Пробую получить субтитры через Supadata API...", end=" ", flush=True)
-            transcript_data = get_supadata_transcript(video_id, lang=args.lang)
+        title = get_video_title(input_path)
+        yt_info["title"] = title
+        transcript_data = None
 
+        # 1. User Proxy
+        if USER_PROXY_URL:
+            print("  [1/4] Пробую User Proxy...", end=" ", flush=True)
+            transcript_data = get_via_user_proxy(video_id)
             if transcript_data:
-                lang = transcript_data.get('lang', '?')
-                segments = transcript_data.get('content', [])
-                print(f"OK ({lang}, {len(segments)} сегментов)")
+                print(f"OK ({len(transcript_data['content'])} сегментов)")
+        else:
+            print("  [1/4] User Proxy: не настроен (USER_PROXY_URL)")
 
-                last_offset = segments[-1].get('offset', 0) + segments[-1].get('duration', 0)
-                duration_s = last_offset / 1000
-                minutes = int(duration_s // 60)
-                seconds = int(duration_s % 60)
+        # 2. Supadata
+        if not transcript_data and get_supadata_keys():
+            print("  [2/4] Пробую Supadata API...", end=" ", flush=True)
+            transcript_data = get_via_supadata(video_id, lang=args.lang)
+            if transcript_data:
+                print(f"OK ({len(transcript_data['content'])} сегментов)")
+            else:
+                print("нет результата")
+        elif not transcript_data:
+            print("  [2/4] Supadata: нет ключей (SUPADATA_API_KEYS)")
 
-                if args.no_timestamps:
-                    text = " ".join(seg.get('text', '').strip() for seg in segments)
-                else:
-                    text = format_supadata_transcript(transcript_data)
+        # 3. Scrapingdog
+        if not transcript_data and SCRAPINGDOG_API_KEY:
+            print("  [3/4] Пробую Scrapingdog...", end=" ", flush=True)
+            transcript_data = get_via_scrapingdog(video_id)
+            if transcript_data:
+                print(f"OK ({len(transcript_data['content'])} сегментов)")
+            else:
+                print("нет результата")
+        elif not transcript_data:
+            print("  [3/4] Scrapingdog: нет ключа (SCRAPINGDOG_API_KEY)")
 
-                raw_json_path = os.path.join(tempfile.gettempdir(), f"yt_transcript_{video_id}.json")
-                with open(raw_json_path, 'w', encoding='utf-8') as f:
-                    json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+        # 4. yt-dlp + ASR
+        if transcript_data:
+            source_name = transcript_data.get("source", "?")
+            segments = transcript_data.get("content", [])
+            lang = transcript_data.get("lang", "?")
 
-                # Получаем название видео через noembed
-                title = "YouTube Video"
-                try:
-                    noembed_url = f"https://noembed.com/embed?url={input_path}"
-                    req = urllib.request.Request(noembed_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    resp = urllib.request.urlopen(req, timeout=10)
-                    noembed_data = json.loads(resp.read().decode('utf-8'))
-                    title = noembed_data.get('title', title)
-                except Exception:
-                    pass
+            last_offset = segments[-1].get("offset", 0) + segments[-1].get("duration", 0)
+            duration_s = last_offset / 1000 if last_offset > 1000 else last_offset
+            minutes = int(duration_s // 60)
+            seconds = int(duration_s % 60)
 
-                result_parts = [
-                    f"## Транскрипция: {title}",
-                    f"",
-                    f"**Источник:** YouTube",
-                    f"**Video ID:** {video_id}",
-                    f"**Длительность:** {minutes}:{seconds:02d}",
-                    f"**Язык субтитров:** {lang}",
-                    f"**Сегментов:** {len(segments)}",
-                    f"**URL:** {input_path}",
-                    f"**Метод:** Supadata API",
-                ]
+            text = format_transcript(transcript_data, args.no_timestamps)
 
-                if args.translate:
-                    result_parts.append(f"**Перевод на:** {args.translate.upper()}")
+            raw_json_path = os.path.join(tempfile.gettempdir(), f"yt_transcript_{video_id}.json")
+            with open(raw_json_path, 'w', encoding='utf-8') as f:
+                json.dump(transcript_data, f, indent=2, ensure_ascii=False)
 
+            result_parts = [
+                f"## Транскрипция: {title}",
+                f"",
+                f"**Источник:** YouTube",
+                f"**Video ID:** {video_id}",
+                f"**Длительность:** {minutes}:{seconds:02d}",
+                f"**Язык:** {lang}",
+                f"**Сегментов:** {len(segments)}",
+                f"**URL:** {input_path}",
+                f"**Метод:** {source_name}",
+            ]
+
+            if args.translate:
+                result_parts.append(f"**Перевод на:** {args.translate.upper()}")
+
+            result_parts.extend([
+                f"",
+                f"### Текст:",
+                f"",
+                text,
+            ])
+
+            if args.translate and text:
                 result_parts.extend([
                     f"",
-                    f"### Текст:",
+                    f"---",
+                    f"### Перевод:",
                     f"",
-                    text,
+                    f"[Перевод выполнен через LLM]",
+                    f"",
                 ])
 
-                if args.translate and text:
-                    result_parts.extend([
-                        f"",
-                        f"---",
-                        f"### Перевод:",
-                        f"",
-                        f"[Перевод выполнен через LLM]",
-                        f"",
-                    ])
+            result = "\n".join(result_parts)
 
-                result = "\n".join(result_parts)
+            print("\n" + "=" * 60)
+            print(result)
 
-                print("\n" + "=" * 60)
-                print(result)
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(result)
+                print(f"\nСохранено в: {args.output}")
 
-                if args.output:
-                    with open(args.output, "w", encoding="utf-8") as f:
-                        f.write(result)
-                    print(f"\nСохранено в: {args.output}")
+            return text
 
-                return text
-
-            else:
-                print("субтитров нет или не удалось получить")
-
-        # Fallback: скачиваем через yt-dlp и транскрибируем через ASR
-        print("Использую yt-dlp + ASR (fallback)...")
-
+        # Все API не дали результат — yt-dlp + ASR
+        print("  [4/4] Все API не дали результат. Использую yt-dlp + ASR...")
         temp_download = os.path.join(tempfile.gettempdir(), "yt_audio.mp3")
         yt_info = download_youtube_audio(input_path, temp_download)
         actual_input = temp_download
