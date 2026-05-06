@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-audio_transcriber.py — Транскрибация длинных аудиофайлов с обходом лимита 30 секунд.
-Поддерживает локальные файлы и YouTube-ссылки.
+audio_transcriber.py — Транскрибация аудиофайлов и YouTube-видео.
+
+Поддерживает три режима работы:
+  1. Локальные аудиофайлы — через ASR (нарезка на чанки по 29 сек)
+  2. YouTube-видео с субтитрами — через Supadata API (быстро, бесплатно)
+  3. YouTube-видео без субтитров — через yt-dlp + ASR (если API не даёт результат)
 
 Использование:
     python3 audio_transcriber.py --input "file.mp3"
@@ -10,8 +14,12 @@ audio_transcriber.py — Транскрибация длинных аудиоф�
 
 Требования:
     - ffmpeg (установлен в системе)
-    - z-ai CLI (z-ai-web-dev-sdk)
-    - yt-dlp (для YouTube-ссылок)
+    - z-ai CLI (z-ai-web-dev-sdk) — для локальных файлов
+    - yt-dlp (для YouTube без субтитров, опционально)
+    - Supadata API ключ (для YouTube субтитров, опционально)
+
+Переменные окружения:
+    SUPADATA_API_KEY — API ключ для supadata.ai
 
 Автор: KindFarmAI / Zai Chat
 Лицензия: MIT
@@ -25,8 +33,82 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
+import urllib.parse
 from pathlib import Path
 
+
+# ============================================================
+# Supadata API — YouTube транскрипты через прокси
+# ============================================================
+
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "")
+
+
+def extract_youtube_id(url: str) -> str:
+    """Извлечь video ID из любой формы YouTube-ссылки."""
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def get_supadata_transcript(video_id: str, lang: str = None) -> dict:
+    """Получить транскрипт YouTube-видео через Supadata API.
+
+    Returns:
+        dict с ключами: lang, available_langs, content (list of {text, offset, duration})
+        или None если не удалось
+    """
+    if not SUPADATA_API_KEY:
+        return None
+
+    url = f"https://api.supadata.ai/v1/youtube/transcript?id={video_id}"
+    if lang:
+        url += f"&lang={lang}"
+
+    headers = {
+        'x-api-key': SUPADATA_API_KEY,
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Origin': 'https://supadata.ai',
+        'Referer': 'https://supadata.ai/',
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=30)
+        result = json.loads(resp.read().decode('utf-8'))
+
+        if result.get('content') and len(result['content']) > 0:
+            return result
+        return None
+    except Exception as e:
+        print(f"  [Supadata] Не удалось получить транскрипт: {e}", file=sys.stderr)
+        return None
+
+
+def format_supadata_transcript(data: dict) -> str:
+    """Преобразовать результат Supadata в текст с таймстемпами."""
+    lines = []
+    for seg in data.get('content', []):
+        offset_ms = seg.get('offset', 0)
+        offset_s = offset_ms / 1000
+        minutes = int(offset_s // 60)
+        seconds = int(offset_s % 60)
+        timestamp = f"[{minutes:02d}:{seconds:02d}]"
+        text = seg.get('text', '').strip()
+        lines.append(f"{timestamp} {text}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# YouTube detection
+# ============================================================
 
 def is_youtube_url(url: str) -> bool:
     """Проверить, является ли строка YouTube-ссылкой."""
@@ -44,13 +126,16 @@ def is_youtube_url(url: str) -> bool:
     return False
 
 
+# ============================================================
+# YouTube download (yt-dlp) — fallback если Supadata не сработал
+# ============================================================
+
 def download_youtube_audio(url: str, output_path: str) -> dict:
     """Скачать аудио с YouTube через yt-dlp.
 
     Returns:
         dict с ключами: title, duration_str, filepath
     """
-    # Ищем yt-dlp
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp:
         local_ytdlp = os.path.expanduser("~/.local/bin/yt-dlp")
@@ -77,7 +162,6 @@ def download_youtube_audio(url: str, output_path: str) -> dict:
             print(f"ОШИБКА: {result.stderr[:200]}")
             sys.exit(1)
 
-        # Найти скачанный файл
         download_dir = os.path.dirname(output_path)
         downloaded = None
         for f in os.listdir(download_dir):
@@ -91,7 +175,6 @@ def download_youtube_audio(url: str, output_path: str) -> dict:
 
         shutil.move(downloaded, output_path)
 
-        # Получаем инфо о видео
         info_result = subprocess.run(
             [ytdlp, "--print", "%(title)s|%(duration_string)s", "--no-download", url],
             capture_output=True, text=True, timeout=30
@@ -119,8 +202,12 @@ def download_youtube_audio(url: str, output_path: str) -> dict:
         sys.exit(1)
 
 
+# ============================================================
+# Локальные аудиофайлы — ASR транскрипция
+# ============================================================
+
 def get_real_duration(file_path: str) -> float:
-    """Получить РЕАЛЬНУЮ длительность аудио через декодирование, а не метаданные."""
+    """Получить РЕАЛЬНУЮ длительность аудио через декодирование."""
     try:
         result = subprocess.run(
             ["ffmpeg", "-i", file_path, "-f", "null", "-"],
@@ -133,7 +220,6 @@ def get_real_duration(file_path: str) -> float:
                     h, m, s, ms = match.groups()
                     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 100
 
-        # Fallback через ffprobe
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", file_path],
@@ -198,7 +284,6 @@ def transcribe_chunks(chunks: list, chunk_dir: str) -> str:
         text = transcribe_chunk(str(chunk), output_json)
 
         if text:
-            # Убираем дубликаты на стыках (последние 3 слова предыдущего)
             if all_texts:
                 prev_words = all_texts[-1].split()[-3:]
                 curr_words = text.split()[:3]
@@ -219,9 +304,13 @@ def transcribe_chunks(chunks: list, chunk_dir: str) -> str:
     return " ".join(all_texts)
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Транскрибация аудиофайлов любой длины + YouTube",
+        description="Транскрибация аудиофайлов и YouTube-видео",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:
@@ -229,37 +318,132 @@ def main():
   python3 audio_transcriber.py --input "https://youtube.com/watch?v=XXXXX"
   python3 audio_transcriber.py --input "podcast.mp3" --translate "ru"
   python3 audio_transcriber.py --input "interview.wav" --output "transcript.txt"
-  python3 audio_transcriber.py --input "recording.mp3" --chunk-size 25
+
+Переменные окружения:
+  SUPADATA_API_KEY    API ключ для supadata.ai (YouTube субтитры через прокси)
         """
     )
 
     parser.add_argument("--input", "-i", required=True, help="Путь к аудиофайлу или YouTube-ссылка")
     parser.add_argument("--output", "-o", default=None, help="Путь к файлу с результатом")
     parser.add_argument("--translate", "-t", default=None, help="Перевести на язык (например: ru, en, de)")
+    parser.add_argument("--lang", "-l", default=None, help="Язык YouTube-субтитров (например: ru, en)")
     parser.add_argument("--chunk-size", "-c", type=int, default=29, help="Размер чанка в секундах (по умолчанию: 29)")
+    parser.add_argument("--no-timestamps", action="store_true", help="Убрать таймстемпы из результата")
 
     args = parser.parse_args()
     input_path = args.input
 
-    # --- YouTube? Скачиваем ---
     is_yt = is_youtube_url(input_path)
-    yt_info = None
-    actual_input = input_path
-    temp_download = None
 
+    # =============================================
+    # YouTube путь — сначала пробуем Supadata API
+    # =============================================
     if is_yt:
+        video_id = extract_youtube_id(input_path)
+        print(f"Источник: YouTube (ID: {video_id})")
+
+        if SUPADATA_API_KEY:
+            print("Пробую получить субтитры через Supadata API...", end=" ", flush=True)
+            transcript_data = get_supadata_transcript(video_id, lang=args.lang)
+
+            if transcript_data:
+                lang = transcript_data.get('lang', '?')
+                segments = transcript_data.get('content', [])
+                print(f"OK ({lang}, {len(segments)} сегментов)")
+
+                last_offset = segments[-1].get('offset', 0) + segments[-1].get('duration', 0)
+                duration_s = last_offset / 1000
+                minutes = int(duration_s // 60)
+                seconds = int(duration_s % 60)
+
+                if args.no_timestamps:
+                    text = " ".join(seg.get('text', '').strip() for seg in segments)
+                else:
+                    text = format_supadata_transcript(transcript_data)
+
+                raw_json_path = os.path.join(tempfile.gettempdir(), f"yt_transcript_{video_id}.json")
+                with open(raw_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+
+                # Получаем название видео через noembed
+                title = "YouTube Video"
+                try:
+                    noembed_url = f"https://noembed.com/embed?url={input_path}"
+                    req = urllib.request.Request(noembed_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    noembed_data = json.loads(resp.read().decode('utf-8'))
+                    title = noembed_data.get('title', title)
+                except Exception:
+                    pass
+
+                result_parts = [
+                    f"## Транскрипция: {title}",
+                    f"",
+                    f"**Источник:** YouTube",
+                    f"**Video ID:** {video_id}",
+                    f"**Длительность:** {minutes}:{seconds:02d}",
+                    f"**Язык субтитров:** {lang}",
+                    f"**Сегментов:** {len(segments)}",
+                    f"**URL:** {input_path}",
+                    f"**Метод:** Supadata API",
+                ]
+
+                if args.translate:
+                    result_parts.append(f"**Перевод на:** {args.translate.upper()}")
+
+                result_parts.extend([
+                    f"",
+                    f"### Текст:",
+                    f"",
+                    text,
+                ])
+
+                if args.translate and text:
+                    result_parts.extend([
+                        f"",
+                        f"---",
+                        f"### Перевод:",
+                        f"",
+                        f"[Перевод выполнен через LLM]",
+                        f"",
+                    ])
+
+                result = "\n".join(result_parts)
+
+                print("\n" + "=" * 60)
+                print(result)
+
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        f.write(result)
+                    print(f"\nСохранено в: {args.output}")
+
+                return text
+
+            else:
+                print("субтитров нет или не удалось получить")
+
+        # Fallback: скачиваем через yt-dlp и транскрибируем через ASR
+        print("Использую yt-dlp + ASR (fallback)...")
+
         temp_download = os.path.join(tempfile.gettempdir(), "yt_audio.mp3")
         yt_info = download_youtube_audio(input_path, temp_download)
         actual_input = temp_download
-        print(f"Источник: YouTube")
     else:
+        # =============================================
+        # Локальный файл
+        # =============================================
         if not os.path.exists(input_path):
             print(f"[ОШИБКА] Файл не найден: {input_path}", file=sys.stderr)
             sys.exit(1)
+        actual_input = input_path
         print(f"Источник: Локальный файл")
         print(f"Файл: {os.path.basename(input_path)}")
 
-    # Шаг 1: Определить реальную длину
+    # =============================================
+    # ASR транскрипция (локальный файл или yt-dlp fallback)
+    # =============================================
     print(f"Определяю реальную длительность...", end=" ", flush=True)
     duration = get_real_duration(actual_input)
     minutes = int(duration // 60)
@@ -270,7 +454,6 @@ def main():
         print("[ОШИБКА] Не удалось определить длительность аудио", file=sys.stderr)
         sys.exit(1)
 
-    # Шаг 2: Конвертировать в WAV + транскрибировать
     print("Конвертирую в WAV 16kHz моно...", end=" ", flush=True)
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = os.path.join(tmpdir, "audio.wav")
@@ -296,10 +479,11 @@ def main():
             print("Транскрибирую:")
             text = transcribe_chunks(chunks, chunk_dir)
 
-    # Шаг 4: Формируем результат
-    title_display = yt_info["title"] if yt_info else os.path.basename(input_path)
+    # Формируем результат
+    title_display = yt_info["title"] if is_yt else os.path.basename(input_path)
     source_display = "YouTube" if is_yt else "Локальный файл"
     format_display = "MP3" if is_yt else os.path.splitext(input_path)[1][1:].upper()
+    method_display = "yt-dlp + ASR" if is_yt else "ASR (z-ai)"
 
     result_parts = [
         f"## Транскрипция: {title_display}",
@@ -307,6 +491,7 @@ def main():
         f"**Источник:** {source_display}",
         f"**Длительность:** {minutes}:{seconds:02d}",
         f"**Формат:** {format_display}",
+        f"**Метод:** {method_display}",
     ]
     if is_yt:
         result_parts.append(f"**URL:** {input_path}")
@@ -333,11 +518,9 @@ def main():
 
     result = "\n".join(result_parts)
 
-    # Вывод
     print("\n" + "=" * 60)
     print(result)
 
-    # Сохранить в файл
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(result)
@@ -347,11 +530,10 @@ def main():
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(text)
         print(f"\nТранскрипция сохранена в: {output_file}")
-        print(f"Теперь передай текст в LLM для перевода на {args.translate}")
 
     # Удаляем временный скачанный файл
-    if temp_download and os.path.exists(temp_download):
-        os.remove(temp_download)
+    if is_yt and os.path.exists(actual_input):
+        os.remove(actual_input)
 
     return text
 

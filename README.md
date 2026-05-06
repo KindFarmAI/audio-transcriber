@@ -2,22 +2,28 @@
 
 ## Описание
 
-Скилл для транскрибации аудиофайлов **любой длины** с автоматическим обходом лимита ASR API (30 секунд).
+Скилл для транскрибации аудиофайлов **любой длины** и **YouTube-видео** с автоматическим обходом лимита ASR API (30 секунд).
+
+### Что нового в v3.0
+- **Supadata API** для мгновенного получения YouTube-субтитров (без скачивания видео!)
+- Автоматический fallback на yt-dlp + ASR если субтитров нет
+- Таймстемпы в транскрипте
+- Автоопределение названия видео
 
 ## Что делает
 
-1. Проверяет **реальную** длину аудио (не метаданные!)
-2. Конвертирует любой формат в WAV 16kHz моно
-3. Нарезает на чанки по 29 секунд
-4. Транскрибирует каждый чанк через ASR
-5. Склеивает результат, убирая дубликаты на стыках
-6. Опционально переводит через LLM
+1. **YouTube:** Получает субтитры через Supadata API (мгновенно, ~2 сек)
+2. **YouTube fallback:** Если нет субтитров — скачивает через yt-dlp, режет на чанки, транскрибирует через ASR
+3. **Локальные файлы:** Проверяет реальную длину, конвертирует в WAV 16kHz, режет на чанки по 29 сек, транскрибирует
+4. Склеивает результат, убирая дубликаты на стыках
+5. Опционально переводит через LLM
 
-## Формат файлов
+## Структура
 
 ```
 audio-transcriber/
 ├── SKILL.md                          ← Описание скилла (для OpenClaw)
+├── README.md                         ← Этот файл
 └── scripts/
     └── audio_transcriber.py          ← Основной скрипт
 ```
@@ -26,43 +32,42 @@ audio-transcriber/
 
 ### Вариант 1: Скопировать в папку скиллов
 
-1. Скопируй всю папку `audio-transcriber` в директорию скиллов OpenClaw:
-   ```
-   cp -r audio-transcriber/ ~/.openclaw/skills/
-   ```
-
-2. Перезапусти OpenClaw (или обнови список скиллов).
+```bash
+cp -r audio-transcriber/ ~/.openclaw/skills/
+```
 
 ### Вариант 2: Через репозиторий
 
-1. Залей папку на GitHub
-2. В OpenClaw добавь репозиторий скиллов:
-   ```
-   /install-skill https://github.com/KindFarmAI/audio-transcriber
-   ```
+```
+/install-skill https://github.com/KindFarmAI/audio-transcriber
+```
 
 ## Использование
 
 ### Через скрипт напрямую:
 
 ```bash
-# Базовая транскрипция
+# YouTube-видео (через Supadata API)
+SUPADATA_API_KEY=sd_xxx python3 scripts/audio_transcriber.py \
+  --input "https://youtube.com/watch?v=XXXXX"
+
+# Локальный файл
 python3 scripts/audio_transcriber.py --input "file.mp3"
 
-# Транскрипция с переводом
+# С переводом
 python3 scripts/audio_transcriber.py --input "file.mp3" --translate "ru"
 
-# Сохранить результат в файл
-python3 scripts/audio_transcriber.py --input "file.mp3" --output "transcript.txt"
+# Без таймстемпов
+python3 scripts/audio_transcriber.py --input "https://youtube.com/watch?v=X" --no-timestamps
 
-# Другой размер чанка
-python3 scripts/audio_transcriber.py --input "file.mp3" --chunk-size 25
+# Указать язык субтитров
+python3 scripts/audio_transcriber.py --input "https://youtube.com/watch?v=X" --lang en
 ```
 
 ### Через OpenClaw (в чате):
 
 ```
-Транскрибируй этот файл: /path/to/audio.mp3
+Транскрибируй это видео: https://youtube.com/watch?v=XXXXX
 Распознай речь в podcast.mp3 и переведи на русский
 Что говорится в этом аудио? interview.wav
 ```
@@ -71,42 +76,40 @@ python3 scripts/audio_transcriber.py --input "file.mp3" --chunk-size 25
 
 - **ffmpeg** — конвертация и нарезка аудио
 - **z-ai CLI** (z-ai-web-dev-sdk) — распознавание речи
-- Python 3.8+
+- **yt-dlp** — скачивание YouTube (только для fallback)
+- **Supadata API ключ** — для YouTube субтитров (100 бесплатно/мес)
 
 ## Установка зависимостей
 
 ```bash
 # Ubuntu/Debian
 sudo apt install ffmpeg python3
+pip install yt-dlp
 
 # macOS
 brew install ffmpeg python3
+pip install yt-dlp
+```
 
-# z-ai CLI уже установлен с OpenClaw
+## Supadata API
+
+Регистрация: https://dash.supadata.ai (через GitHub)
+
+Free-план: 100 запросов/мес (1 транскрипт = 1 кредит)
+
+```bash
+# Задать ключ через переменную окружения
+export SUPADATA_API_KEY=sd_xxxxxxxxxxxx
+
+# Или указать перед командой
+SUPADATA_API_KEY=sd_xxx python3 scripts/audio_transcriber.py --input "URL"
 ```
 
 ## Ограничения
 
 - ASR API лимит: 30 секунд на запрос (скилл обходит через нарезку)
-- Поддерживаемые форматы: MP3, WAV, M4A, OGG, FLAC, WebM и другие (через ffmpeg)
+- Supadata free: 100 видео/мес
+- Поддерживаемые форматы: MP3, WAV, M4A, OGG, FLAC, WebM
 - Качество транскрипции зависит от чёткости речи и уровня шума
 - Инструментальные фрагменты (без речи) пропускаются автоматически
-
-## Пример вывода
-
-```
-## Транскрипция: Era - Ameno.mp3
-
-**Длительность:** 4:14
-**Формат:** MP3
-**Перевод на:** RU
-
-### Текст:
-
-Dorime interimo ad apare dorime, ameno ameno lanciremo dorime...
-
----
-### Перевод:
-
-Дориме, проведи меня сквозь тьму...
-```
+- YouTube может блокировать yt-dlp с cloud-серверов (Supadata решает эту проблему)
